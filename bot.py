@@ -6,6 +6,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import base64
 import json
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,15 +18,19 @@ SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE")
 SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
 user_listings = {}
 
-PLATFORM_RULES = {
-    "shopify": {"title_max": 255, "has_bullets": False, "has_tags": True},
-    "amazon": {"title_max": 200, "has_bullets": True, "has_tags": False},
-    "etsy": {"title_max": 140, "has_bullets": False, "has_tags": True, "tags_max": 13},
-    "ebay": {"title_max": 80, "has_bullets": False, "has_tags": False},
-}
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, *args):
+        pass
+
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', 10000), HealthHandler)
+    server.serve_forever()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -52,14 +58,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text("🔍 Анализирую фото... подожди немного.")
-    
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     file_url = file.file_path
-    
     response = requests.get(file_url)
     image_data = base64.b64encode(response.content).decode("utf-8")
-    
     prompt = """Ты эксперт по e-commerce для бренда KIZIMA® — единственного производителя изделий из балтийского янтаря в США (Нью-Йорк).
 
 Создай листинги для этого изделия из янтаря для 4 платформ. Отвечай ТОЛЬКО в JSON формате:
@@ -92,42 +95,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     "description": "HTML описание для eBay"
   }
 }"""
-
     message = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=4000,
         messages=[{
             "role": "user",
             "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_data
-                    }
-                },
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
                 {"type": "text", "text": prompt}
             ]
         }]
     )
-    
     text = message.content[0].text
     text_clean = text.replace("```json", "").replace("```", "").strip()
     listing = json.loads(text_clean)
     user_listings[user_id] = listing
-    
     keyboard = [
         [InlineKeyboardButton("🛍 Shopify", callback_data="show_shopify"),
          InlineKeyboardButton("📦 Amazon", callback_data="show_amazon")],
         [InlineKeyboardButton("🎨 Etsy", callback_data="show_etsy"),
          InlineKeyboardButton("🏪 eBay", callback_data="show_ebay")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(
-        f"✅ Листинги готовы для: *{listing.get('product_name', 'изделие')}*\n\nВыбери платформу для просмотра:",
-        reply_markup=reply_markup,
+        f"✅ Листинги готовы для: *{listing.get('product_name', 'изделие')}*\n\nВыбери платформу:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
@@ -135,39 +126,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    
     if user_id not in user_listings:
         await query.message.reply_text("❌ Сначала отправь фото изделия.")
         return
-    
     listing = user_listings[user_id]
     data = query.data
-    
     if data == "show_shopify":
         s = listing["shopify"]
         text = f"🛍 *SHOPIFY*\n\n*Title:*\n{s['title']}\n\n*Tags:*\n{', '.join(s['tags'])}\n\n*Description:*\n{s['description'][:500]}..."
         keyboard = [[InlineKeyboardButton("🚀 Опубликовать в Shopify", callback_data="publish_shopify")]]
-        
     elif data == "show_amazon":
         a = listing["amazon"]
         bullets = "\n".join(a["bullets"])
         text = f"📦 *AMAZON*\n\n*Title:*\n{a['title']}\n\n*Bullets:*\n{bullets}"
         keyboard = []
-        
     elif data == "show_etsy":
         e = listing["etsy"]
         text = f"🎨 *ETSY*\n\n*Title:*\n{e['title']}\n\n*Tags:*\n{', '.join(e['tags'])}\n\n*Description:*\n{e['description'][:500]}..."
         keyboard = []
-        
     elif data == "show_ebay":
         eb = listing["ebay"]
         text = f"🏪 *EBAY*\n\n*Title:*\n{eb['title']}\n\n*Description:*\n{eb['description'][:500]}..."
         keyboard = []
-        
     elif data == "publish_shopify":
         await publish_to_shopify(query, listing)
         return
-    
     keyboard.append([
         InlineKeyboardButton("🛍 Shopify", callback_data="show_shopify"),
         InlineKeyboardButton("📦 Amazon", callback_data="show_amazon"),
@@ -176,12 +159,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🎨 Etsy", callback_data="show_etsy"),
         InlineKeyboardButton("🏪 eBay", callback_data="show_ebay"),
     ])
-    
     await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def publish_to_shopify(query, listing):
     s = listing["shopify"]
-    
     product_data = {
         "product": {
             "title": s["title"],
@@ -191,67 +172,51 @@ async def publish_to_shopify(query, listing):
             "vendor": "KIZIMA®"
         }
     }
-    
     url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
         "Content-Type": "application/json"
     }
-    
     response = requests.post(url, json=product_data, headers=headers)
-    
     if response.status_code == 201:
         product = response.json()["product"]
-        product_id = product["id"]
         await query.message.reply_text(
-            f"✅ Продукт создан в Shopify!\n\n"
-            f"ID: {product_id}\n"
-            f"Статус: Draft (черновик)\n\n"
-            f"Открой Shopify Admin чтобы добавить фото и опубликовать."
+            f"✅ Продукт создан в Shopify!\n\nID: {product['id']}\nСтатус: Draft"
         )
     else:
-        await query.message.reply_text(f"❌ Ошибка Shopify: {response.status_code}\n{response.text}")
+        await query.message.reply_text(f"❌ Ошибка Shopify: {response.status_code}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.lower()
-    
     if user_id not in user_listings:
         await update.message.reply_text("📸 Отправь фото изделия чтобы начать.")
         return
-    
     listing = user_listings[user_id]
-    
     edit_prompt = f"""Текущий листинг: {json.dumps(listing, ensure_ascii=False)}
-    
 Пользователь просит: {update.message.text}
-
 Измени только то что просят. Верни ПОЛНЫЙ обновлённый JSON в том же формате."""
-    
     message = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=4000,
         messages=[{"role": "user", "content": edit_prompt}]
     )
-    
     text_resp = message.content[0].text
     text_clean = text_resp.replace("```json", "").replace("```", "").strip()
     updated = json.loads(text_clean)
     user_listings[user_id] = updated
-    
     keyboard = [
         [InlineKeyboardButton("🛍 Shopify", callback_data="show_shopify"),
          InlineKeyboardButton("📦 Amazon", callback_data="show_amazon")],
         [InlineKeyboardButton("🎨 Etsy", callback_data="show_etsy"),
          InlineKeyboardButton("🏪 eBay", callback_data="show_ebay")],
     ]
-    
     await update.message.reply_text(
-        "✅ Листинг обновлён! Выбери платформу для просмотра:",
+        "✅ Листинг обновлён! Выбери платформу:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 def main():
+    threading.Thread(target=run_health_server, daemon=True).start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -259,7 +224,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
     logger.info("Bot started!")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
